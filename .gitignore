@@ -1,0 +1,30 @@
+# Secrets and local config
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.python-version
+dist/
+*.egg-info/
+
+# Database files
+data/
+logs/
+*.db
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo

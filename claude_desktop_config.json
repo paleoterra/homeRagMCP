@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "brain": {
+      "command": "uv",
+      "args": [
+        "--directory", "/Users/tmoore/workspace/brain",
+        "run", "python", "-m", "brain.server"
+      ],
+      "env": {
+        "DATABASE_URL": "postgresql://brain:brain@localhost:5432/brain",
+        "OLLAMA_URL": "http://localhost:11434",
+        "OLLAMA_MODEL": "nomic-embed-text"
+      }
+    }
+  }
+}
