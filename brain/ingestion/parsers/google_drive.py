@@ -168,3 +168,210 @@ class GoogleAuth:
                 ) from e
 
         return creds
+
+
+# ---------------------------------------------------------------------------
+# MIME type constants
+# ---------------------------------------------------------------------------
+
+MAX_SHEET_ROWS = 1000
+
+_MIME_GDOC = "application/vnd.google-apps.document"
+_MIME_GSHEET = "application/vnd.google-apps.spreadsheet"
+_MIME_GSLIDE = "application/vnd.google-apps.presentation"
+_MIME_GFOLDER = "application/vnd.google-apps.folder"
+_MIME_GAPPS_PREFIX = "application/vnd.google-apps."
+
+
+# ---------------------------------------------------------------------------
+# Drive client
+# ---------------------------------------------------------------------------
+
+
+class GoogleDriveClient:
+    """Wraps Google Drive, Docs, Sheets, and Slides APIs."""
+
+    def __init__(self) -> None:
+        try:
+            from googleapiclient.discovery import build
+        except ImportError:
+            raise ImportError(
+                "Google API client is required: uv sync --extra google"
+            )
+
+        creds = GoogleAuth().get_credentials()
+        self._drive = build("drive", "v3", credentials=creds)
+        self._docs = build("docs", "v1", credentials=creds)
+        self._sheets = build("sheets", "v4", credentials=creds)
+        self._slides = build("slides", "v1", credentials=creds)
+
+    # ------------------------------------------------------------------
+    # fetch_item
+    # ------------------------------------------------------------------
+
+    def fetch_item(self, file_id: str) -> FetchItemResult:
+        """Fetch and parse a single Drive item by file ID."""
+        meta = (
+            self._drive.files()
+            .get(fileId=file_id, fields="id,name,mimeType,modifiedTime,owners")
+            .execute()
+        )
+        mime = meta["mimeType"]
+        name = meta["name"]
+        author = (meta.get("owners") or [{}])[0].get("displayName")
+        modified = meta.get("modifiedTime", "")
+        base_meta = {"modified_time": modified, "mime_type": mime, "file_id": file_id}
+
+        if mime == _MIME_GFOLDER:
+            raise ValueError("Use fetch_folder() for folders, not fetch_item().")
+
+        if mime == _MIME_GDOC:
+            return self._parse_doc(file_id, name, author, base_meta)
+
+        if mime == _MIME_GSHEET:
+            return self._parse_sheet(file_id, name, author, base_meta)
+
+        if mime == _MIME_GSLIDE:
+            return self._parse_slide(file_id, name, author, base_meta)
+
+        if mime.startswith(_MIME_GAPPS_PREFIX):
+            raise UnsupportedGoogleTypeError(mime)
+
+        # Binary file — caller downloads and routes through ingest_file
+        return BinaryDriveFile(file_id=file_id, name=name, mime_type=mime)
+
+    # ------------------------------------------------------------------
+    # Google Docs
+    # ------------------------------------------------------------------
+
+    def _parse_doc(self, file_id, name, author, meta) -> GoogleParsedDocument:
+        doc = self._docs.documents().get(documentId=file_id).execute()
+        content = self._extract_doc_text(doc)
+        return GoogleParsedDocument(
+            title=name,
+            content=content,
+            source_type="gdoc",
+            file_id=file_id,
+            author=author,
+            pre_chunks=None,
+            metadata=meta,
+        )
+
+    def _extract_doc_text(self, doc: dict) -> str:
+        """Walk Docs API structural elements and extract plain text."""
+        lines = []
+        for element in doc.get("body", {}).get("content", []):
+            para = element.get("paragraph")
+            if not para:
+                continue
+            for elem in para.get("elements", []):
+                text = elem.get("textRun", {}).get("content", "")
+                if text:
+                    lines.append(text)
+        return "".join(lines).strip()
+
+    # ------------------------------------------------------------------
+    # Google Sheets
+    # ------------------------------------------------------------------
+
+    def _parse_sheet(self, file_id, name, author, meta) -> GoogleParsedDocument:
+        spreadsheet = (
+            self._sheets.spreadsheets()
+            .get(spreadsheetId=file_id, includeGridData=True)
+            .execute()
+        )
+        pre_chunks = []
+        all_text_parts = []
+
+        for tab_index, sheet in enumerate(spreadsheet.get("sheets", [])):
+            tab_name = sheet["properties"]["title"]
+            rows = []
+            for grid in sheet.get("data", []):
+                for row_data in grid.get("rowData", []):
+                    cells = [
+                        str(c.get("formattedValue", ""))
+                        for c in row_data.get("values", [])
+                    ]
+                    rows.append(",".join(cells))
+                    if len(rows) >= MAX_SHEET_ROWS:
+                        break
+                if len(rows) >= MAX_SHEET_ROWS:
+                    break
+
+            if not any(r.strip() for r in rows):
+                continue  # skip empty tabs
+
+            truncated = len(rows) >= MAX_SHEET_ROWS
+            csv_text = "\n".join(rows)
+            if truncated:
+                csv_text += "\n# ... truncated"
+
+            chunk_content = f"[Tab: {tab_name}]\n{csv_text}"
+            pre_chunks.append({"content": chunk_content, "page_number": tab_index})
+            all_text_parts.append(chunk_content)
+
+        full_content = "\n\n".join(all_text_parts)
+        return GoogleParsedDocument(
+            title=name,
+            content=full_content,
+            source_type="gsheet",
+            file_id=file_id,
+            author=author,
+            pre_chunks=pre_chunks if pre_chunks else None,
+            metadata=meta,
+        )
+
+    # ------------------------------------------------------------------
+    # Google Slides
+    # ------------------------------------------------------------------
+
+    def _parse_slide(self, file_id, name, author, meta) -> GoogleParsedDocument:
+        presentation = self._slides.presentations().get(presentationId=file_id).execute()
+        pre_chunks = []
+        all_text_parts = []
+
+        for slide_index, slide in enumerate(presentation.get("slides", []), start=1):
+            texts = self._extract_slide_text(slide)
+            notes = self._extract_slide_notes(slide)
+            parts = texts + notes
+            chunk_content = "\n".join(parts) if parts else f"[Slide {slide_index}]"
+            pre_chunks.append({"content": chunk_content, "page_number": slide_index})
+            all_text_parts.append(chunk_content)
+
+        full_content = "\n\n".join(all_text_parts)
+        return GoogleParsedDocument(
+            title=name,
+            content=full_content,
+            source_type="gslide",
+            file_id=file_id,
+            author=author,
+            pre_chunks=pre_chunks if pre_chunks else None,
+            metadata=meta,
+        )
+
+    def _extract_slide_text(self, slide: dict) -> list[str]:
+        """Extract all text from slide page elements."""
+        texts = []
+        for element in slide.get("pageElements", []):
+            shape = element.get("shape", {})
+            text_content = shape.get("text", {})
+            for item in text_content.get("textElements", []):
+                run = item.get("textRun", {})
+                content = run.get("content", "").strip()
+                if content:
+                    texts.append(content)
+        return texts
+
+    def _extract_slide_notes(self, slide: dict) -> list[str]:
+        """Extract speaker notes from a slide."""
+        notes = []
+        notes_page = slide.get("slideProperties", {}).get("notesPage", {})
+        for element in notes_page.get("pageElements", []):
+            shape = element.get("shape", {})
+            text_content = shape.get("text", {})
+            for item in text_content.get("textElements", []):
+                run = item.get("textRun", {})
+                content = run.get("content", "").strip()
+                if content:
+                    notes.append(f"[Note] {content}")
+        return notes

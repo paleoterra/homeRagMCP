@@ -3,7 +3,109 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
-from brain.ingestion.parsers.google_drive import _extract_google_id, UnsupportedGoogleTypeError, GoogleAuth
+from brain.ingestion.parsers.google_drive import (
+    _extract_google_id,
+    UnsupportedGoogleTypeError,
+    GoogleAuth,
+    GoogleDriveClient,
+    GoogleParsedDocument,
+    BinaryDriveFile,
+)
+
+
+def _make_client():
+    """Return a GoogleDriveClient with mocked credentials."""
+    with patch.object(GoogleAuth, "get_credentials", return_value=MagicMock()), \
+         patch("googleapiclient.discovery.build", return_value=MagicMock()):
+        return GoogleDriveClient()
+
+
+def test_fetch_item_binary_returns_binary_drive_file():
+    """A PDF stored in Drive returns a BinaryDriveFile."""
+    client = _make_client()
+    fake_drive = MagicMock()
+    fake_drive.files().get().execute.return_value = {
+        "id": "PDFID",
+        "name": "report.pdf",
+        "mimeType": "application/pdf",
+        "modifiedTime": "2026-01-01T00:00:00Z",
+        "owners": [{"displayName": "Alice"}],
+    }
+    with patch.object(client, "_drive", fake_drive):
+        result = client.fetch_item("PDFID")
+    assert isinstance(result, BinaryDriveFile)
+    assert result.file_id == "PDFID"
+    assert result.name == "report.pdf"
+    assert result.mime_type == "application/pdf"
+
+
+def test_fetch_item_folder_raises():
+    """Passing a folder ID to fetch_item raises ValueError."""
+    client = _make_client()
+    fake_drive = MagicMock()
+    fake_drive.files().get().execute.return_value = {
+        "id": "FOLDERID",
+        "name": "My Folder",
+        "mimeType": "application/vnd.google-apps.folder",
+        "modifiedTime": "2026-01-01T00:00:00Z",
+        "owners": [],
+    }
+    with patch.object(client, "_drive", fake_drive):
+        with pytest.raises(ValueError, match="fetch_folder"):
+            client.fetch_item("FOLDERID")
+
+
+def test_fetch_item_unsupported_google_type_raises():
+    """A Google Form raises UnsupportedGoogleTypeError."""
+    client = _make_client()
+    fake_drive = MagicMock()
+    fake_drive.files().get().execute.return_value = {
+        "id": "FORMID",
+        "name": "Survey",
+        "mimeType": "application/vnd.google-apps.form",
+        "modifiedTime": "2026-01-01T00:00:00Z",
+        "owners": [],
+    }
+    with patch.object(client, "_drive", fake_drive):
+        with pytest.raises(UnsupportedGoogleTypeError):
+            client.fetch_item("FORMID")
+
+
+def test_fetch_item_google_doc():
+    """A Google Doc returns a GoogleParsedDocument with source_type gdoc."""
+    client = _make_client()
+    fake_drive = MagicMock()
+    fake_drive.files().get().execute.return_value = {
+        "id": "DOCID",
+        "name": "My Doc",
+        "mimeType": "application/vnd.google-apps.document",
+        "modifiedTime": "2026-01-01T00:00:00Z",
+        "owners": [{"displayName": "Bob"}],
+    }
+    fake_doc_content = {
+        "body": {
+            "content": [
+                {"paragraph": {"elements": [{"textRun": {"content": "Hello world\n"}}]}},
+                {"paragraph": {"elements": [{"textRun": {"content": "Second paragraph\n"}}]}},
+            ]
+        }
+    }
+    fake_docs = MagicMock()
+    fake_docs.documents().get().execute.return_value = fake_doc_content
+
+    with patch.object(client, "_drive", fake_drive), \
+         patch.object(client, "_docs", fake_docs):
+        result = client.fetch_item("DOCID")
+
+    assert isinstance(result, GoogleParsedDocument)
+    assert result.source_type == "gdoc"
+    assert result.title == "My Doc"
+    assert result.author == "Bob"
+    assert result.file_id == "DOCID"
+    assert result.pre_chunks is None
+    assert "Hello world" in result.content
+    assert "Second paragraph" in result.content
+    assert result.metadata["modified_time"] == "2026-01-01T00:00:00Z"
 
 
 def test_extract_docs_url():
