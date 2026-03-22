@@ -15,7 +15,7 @@ from mcp.server.fastmcp import FastMCP
 load_dotenv()
 
 from brain.embedder import Embedder
-from brain.ingestion.pipeline import ingest_chat, ingest_email, ingest_file, ingest_mbox, ingest_text, ingest_url
+from brain.ingestion.pipeline import ingest_chat, ingest_email, ingest_file, ingest_google_folder, ingest_google_item, ingest_mbox, ingest_text, ingest_url
 
 # ---------------------------------------------------------------------------
 # Service instances
@@ -266,6 +266,72 @@ async def add_mbox(
 
 
 @mcp.tool()
+async def add_google_drive_item(
+    url_or_id: str,
+    tags: list[str] = [],
+    force: bool = False,
+) -> str:
+    """Ingest a single Google Drive item into the brain.
+
+    Supports Google Docs, Sheets, Slides, and binary files (PDF, DOCX, etc.)
+    stored in Drive. Accepts full Google URLs or a bare file ID.
+
+    Args:
+        url_or_id: Full Google URL (Docs/Sheets/Slides/Drive) or bare file ID.
+        tags: Optional list of tag strings.
+        force: If True, re-index even if this Drive item was previously ingested.
+    """
+    try:
+        doc_id = await ingest_google_item(db, embedder, url_or_id, tags=tags or [], force=force)
+        action = "Re-indexed" if force else "Ingested"
+        # Fetch the title from DB — ingest_google_item only returns the UUID
+        doc = await db.get_document(doc_id)
+        title = (doc or {}).get("title") or "Drive item"
+        return f"{action} '{title}' as document {doc_id}"
+    except ValueError as e:
+        return str(e)
+    except Exception as e:
+        return f"Error ingesting Drive item: {e}"
+
+
+@mcp.tool()
+async def add_google_drive_folder(
+    url_or_id: str,
+    tags: list[str] = [],
+    force: bool = False,
+) -> str:
+    """Recursively ingest all files in a Google Drive folder into the brain.
+
+    Descends into all subfolders. Supports Google Docs, Sheets, Slides,
+    and binary files (PDF, DOCX, etc.). Only personal My Drive folders
+    are supported (not Shared Drives).
+
+    Args:
+        url_or_id: Full Drive folder URL or bare folder ID.
+        tags: Optional tags applied to every ingested file.
+        force: If True, re-index files already in the brain.
+    """
+    try:
+        result = await ingest_google_folder(
+            db, embedder, url_or_id, tags=tags or [], force=force
+        )
+        reasons = result["skip_reasons"]
+        reason_str = ""
+        if reasons:
+            parts = [f"{v} {k}" for k, v in sorted(reasons.items())]
+            reason_str = f" ({', '.join(parts)})"
+        return (
+            f"Ingested {result['ingested']} items, "
+            f"skipped {result['skipped']}{reason_str}, "
+            f"failed {result['failed']}."
+        )
+    except ValueError as e:
+        return str(e)
+    except Exception as e:
+        return f"Error ingesting Drive folder: {e}"
+
+
+@mcp.tool()
 async def update_document(document_id: str) -> str:
     """Re-index a document from its original source.
 
@@ -303,6 +369,9 @@ async def update_document(document_id: str) -> str:
         elif source_type == "chat":
             new_ids = await ingest_chat(db, embedder, source_ref, tags=tags, force=True)
             return f"Updated chat file — {len(new_ids)} conversation(s) re-indexed"
+        elif source_type in ("gdoc", "gsheet", "gslide"):
+            new_id = await ingest_google_item(db, embedder, source_ref, tags=tags, force=True)
+            return f"Updated {source_type} — new document id: {new_id}"
         else:
             return (
                 f"Cannot auto-update source type '{source_type}'.\n"
