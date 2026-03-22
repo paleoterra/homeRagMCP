@@ -315,3 +315,62 @@ def test_parse_slide_pre_chunks_with_notes():
     # Slide 2: empty → falls back to "[Slide 2]"
     assert result.pre_chunks[1]["page_number"] == 2
     assert "[Slide 2]" in result.pre_chunks[1]["content"]
+
+
+def test_fetch_folder_returns_flat_file_ids():
+    """fetch_folder returns a flat list of non-folder file IDs, recursing into subfolders."""
+    client = _make_client()
+
+    def fake_list(q, fields, pageToken=None):
+        mock = MagicMock()
+        if "ROOTFOLDER" in q:
+            mock.execute.return_value = {
+                "files": [
+                    {"id": "FILE1", "mimeType": "application/pdf", "name": "a.pdf"},
+                    {"id": "FILE2", "mimeType": "application/vnd.google-apps.document", "name": "doc"},
+                    {"id": "SUBFOLDER", "mimeType": "application/vnd.google-apps.folder", "name": "sub"},
+                ],
+                "nextPageToken": None,
+            }
+        elif "SUBFOLDER" in q:
+            mock.execute.return_value = {
+                "files": [
+                    {"id": "FILE3", "mimeType": "application/pdf", "name": "b.pdf"},
+                ],
+                "nextPageToken": None,
+            }
+        else:
+            mock.execute.return_value = {"files": [], "nextPageToken": None}
+        return mock
+
+    root_meta = MagicMock()
+    root_meta.execute.return_value = {
+        "id": "ROOTFOLDER",
+        "mimeType": "application/vnd.google-apps.folder",
+        "driveId": None,
+    }
+
+    fake_drive = MagicMock()
+    fake_drive.files().get.return_value = root_meta
+    fake_drive.files().list.side_effect = fake_list
+
+    with patch.object(client, "_drive", fake_drive):
+        result = client.fetch_folder("ROOTFOLDER")
+
+    assert sorted(result) == ["FILE1", "FILE2", "FILE3"]
+
+
+def test_fetch_folder_shared_drive_raises():
+    """fetch_folder raises ValueError for Shared Drive folders."""
+    client = _make_client()
+    root_meta = MagicMock()
+    root_meta.execute.return_value = {
+        "id": "SHAREDFOLDER",
+        "mimeType": "application/vnd.google-apps.folder",
+        "driveId": "DRIVE123",
+    }
+    fake_drive = MagicMock()
+    fake_drive.files().get.return_value = root_meta
+    with patch.object(client, "_drive", fake_drive):
+        with pytest.raises(ValueError, match="Shared Drive"):
+            client.fetch_folder("SHAREDFOLDER")

@@ -364,6 +364,58 @@ class GoogleDriveClient:
                     texts.append(content)
         return texts
 
+    # ------------------------------------------------------------------
+    # fetch_folder
+    # ------------------------------------------------------------------
+
+    def fetch_folder(self, folder_id: str) -> list[str]:
+        """Recursively list all non-trashed file IDs under a folder.
+
+        Does not include folder IDs themselves in the result.
+        Raises ValueError if the folder belongs to a Shared Drive.
+        """
+        # Check for Shared Drive membership
+        meta = (
+            self._drive.files()
+            .get(fileId=folder_id, fields="id,mimeType,driveId")
+            .execute()
+        )
+        if meta.get("driveId"):
+            raise ValueError(
+                "Shared Drives are not supported. "
+                "Only personal My Drive folders are supported."
+            )
+
+        return self._list_folder_recursive(folder_id)
+
+    def _list_folder_recursive(self, folder_id: str) -> list[str]:
+        """Walk folder tree, returning a flat list of file IDs (no folders)."""
+        file_ids: list[str] = []
+        page_token = None
+
+        while True:
+            kwargs = {
+                "q": f"'{folder_id}' in parents and trashed=false",
+                "fields": "nextPageToken,files(id,mimeType,name)",
+            }
+            if page_token:
+                kwargs["pageToken"] = page_token
+
+            response = self._drive.files().list(**kwargs).execute()
+
+            for item in response.get("files", []):
+                if item["mimeType"] == _MIME_GFOLDER:
+                    # Recurse into subfolder
+                    file_ids.extend(self._list_folder_recursive(item["id"]))
+                else:
+                    file_ids.append(item["id"])
+
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+
+        return file_ids
+
     def _extract_slide_notes(self, slide: dict) -> list[str]:
         """Extract speaker notes from a slide."""
         notes = []
