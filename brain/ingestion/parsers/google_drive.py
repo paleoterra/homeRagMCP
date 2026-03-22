@@ -293,15 +293,17 @@ class GoogleDriveClient:
                         for c in row_data.get("values", [])
                     ]
                     rows.append(",".join(cells))
-                    if len(rows) >= MAX_SHEET_ROWS:
+                    if len(rows) > MAX_SHEET_ROWS:
                         break
-                if len(rows) >= MAX_SHEET_ROWS:
+                if len(rows) > MAX_SHEET_ROWS:
                     break
 
             if not any(r.strip() for r in rows):
                 continue  # skip empty tabs
 
-            truncated = len(rows) >= MAX_SHEET_ROWS
+            truncated = len(rows) > MAX_SHEET_ROWS
+            if truncated:
+                rows = rows[:MAX_SHEET_ROWS]
             csv_text = "\n".join(rows)
             if truncated:
                 csv_text += "\n# ... truncated"

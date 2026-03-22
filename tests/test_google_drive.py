@@ -190,3 +190,128 @@ def test_google_auth_service_account(tmp_path, monkeypatch):
         auth = GoogleAuth()
         creds = auth.get_credentials()
     assert creds is fake_creds
+
+
+def test_parse_sheet_tabs_become_pre_chunks():
+    """Each non-empty tab becomes a pre-chunk with correct page_number (0-based)."""
+    client = _make_client()
+    fake_sheets = MagicMock()
+    fake_sheets.spreadsheets().get().execute.return_value = {
+        "sheets": [
+            {
+                "properties": {"title": "Sheet1"},
+                "data": [{"rowData": [
+                    {"values": [{"formattedValue": "A"}, {"formattedValue": "B"}]},
+                    {"values": [{"formattedValue": "C"}, {"formattedValue": "D"}]},
+                ]}],
+            },
+            {
+                "properties": {"title": "Empty"},
+                "data": [{"rowData": []}],
+            },
+            {
+                "properties": {"title": "Sheet2"},
+                "data": [{"rowData": [
+                    {"values": [{"formattedValue": "X"}]},
+                ]}],
+            },
+        ]
+    }
+    fake_drive = MagicMock()
+    fake_drive.files().get().execute.return_value = {
+        "id": "SHEETID", "name": "My Sheet",
+        "mimeType": "application/vnd.google-apps.spreadsheet",
+        "modifiedTime": "2026-01-01T00:00:00Z", "owners": [],
+    }
+    with patch.object(client, "_drive", fake_drive), \
+         patch.object(client, "_sheets", fake_sheets):
+        result = client.fetch_item("SHEETID")
+
+    assert isinstance(result, GoogleParsedDocument)
+    assert result.source_type == "gsheet"
+    # Empty tab skipped — only 2 non-empty tabs
+    assert len(result.pre_chunks) == 2
+    assert result.pre_chunks[0]["page_number"] == 0  # Sheet1
+    assert result.pre_chunks[1]["page_number"] == 2  # Sheet2 (index 2)
+    assert "[Tab: Sheet1]" in result.pre_chunks[0]["content"]
+    assert "A,B" in result.pre_chunks[0]["content"]
+    assert "[Tab: Sheet2]" in result.pre_chunks[1]["content"]
+
+
+def test_parse_sheet_truncation():
+    """Sheets with more than MAX_SHEET_ROWS rows get truncated suffix."""
+    from brain.ingestion.parsers.google_drive import MAX_SHEET_ROWS
+    client = _make_client()
+
+    # Create MAX_SHEET_ROWS + 1 rows to trigger truncation
+    row_data = [{"values": [{"formattedValue": f"row{i}"}]} for i in range(MAX_SHEET_ROWS + 1)]
+
+    fake_sheets = MagicMock()
+    fake_sheets.spreadsheets().get().execute.return_value = {
+        "sheets": [
+            {
+                "properties": {"title": "Big"},
+                "data": [{"rowData": row_data}],
+            }
+        ]
+    }
+    fake_drive = MagicMock()
+    fake_drive.files().get().execute.return_value = {
+        "id": "BIGID", "name": "Big Sheet",
+        "mimeType": "application/vnd.google-apps.spreadsheet",
+        "modifiedTime": "2026-01-01T00:00:00Z", "owners": [],
+    }
+    with patch.object(client, "_drive", fake_drive), \
+         patch.object(client, "_sheets", fake_sheets):
+        result = client.fetch_item("BIGID")
+
+    assert "# ... truncated" in result.pre_chunks[0]["content"]
+    # Should have exactly MAX_SHEET_ROWS rows, not MAX_SHEET_ROWS + 1
+    lines = [l for l in result.pre_chunks[0]["content"].split("\n") if not l.startswith("[") and not l.startswith("#")]
+    assert len(lines) == MAX_SHEET_ROWS
+
+
+def test_parse_slide_pre_chunks_with_notes():
+    """Each slide becomes a pre-chunk with 1-based page_number, including speaker notes."""
+    client = _make_client()
+    fake_slides = MagicMock()
+    fake_slides.presentations().get().execute.return_value = {
+        "slides": [
+            {
+                "pageElements": [
+                    {"shape": {"text": {"textElements": [{"textRun": {"content": "Title Slide"}}]}}},
+                ],
+                "slideProperties": {
+                    "notesPage": {
+                        "pageElements": [
+                            {"shape": {"text": {"textElements": [{"textRun": {"content": "Speaker note here"}}]}}},
+                        ]
+                    }
+                },
+            },
+            {
+                "pageElements": [],
+                "slideProperties": {"notesPage": {"pageElements": []}},
+            },
+        ]
+    }
+    fake_drive = MagicMock()
+    fake_drive.files().get().execute.return_value = {
+        "id": "SLIDEID", "name": "My Slides",
+        "mimeType": "application/vnd.google-apps.presentation",
+        "modifiedTime": "2026-01-01T00:00:00Z", "owners": [],
+    }
+    with patch.object(client, "_drive", fake_drive), \
+         patch.object(client, "_slides", fake_slides):
+        result = client.fetch_item("SLIDEID")
+
+    assert isinstance(result, GoogleParsedDocument)
+    assert result.source_type == "gslide"
+    assert len(result.pre_chunks) == 2
+    # Slide 1: 1-based index = 1
+    assert result.pre_chunks[0]["page_number"] == 1
+    assert "Title Slide" in result.pre_chunks[0]["content"]
+    assert "[Note] Speaker note here" in result.pre_chunks[0]["content"]
+    # Slide 2: empty → falls back to "[Slide 2]"
+    assert result.pre_chunks[1]["page_number"] == 2
+    assert "[Slide 2]" in result.pre_chunks[1]["content"]
