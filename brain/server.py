@@ -338,7 +338,7 @@ async def update_document(document_id: str) -> str:
     Fetches the current content from the original source (file, URL) and
     replaces the stored document with a fresh index. Tags are preserved.
 
-    Works for: pdf, doc, md, txt, url, chat
+    Works for: pdf, doc, md, txt, url, chat, gdoc, gsheet, gslide
     Does not work for: note, email (no stable re-fetchable source)
 
     Args:
@@ -399,7 +399,7 @@ async def search(
     Args:
         query: Natural language query — what you're looking for.
         limit: Max number of results to return (default 5).
-        source_types: Filter by type: "note", "pdf", "url", "email", "doc", "txt".
+        source_types: Filter by type: "note", "pdf", "url", "email", "doc", "txt", "gdoc", "gsheet", "gslide".
     """
     try:
         embedding = await embedder.embed(query)
@@ -445,7 +445,7 @@ async def list_documents(
     """Browse documents stored in the brain.
 
     Args:
-        source_type: Filter by type ("note", "pdf", "url", "email", "doc", "txt"). Empty = all.
+        source_type: Filter by type ("note", "pdf", "url", "email", "doc", "txt", "gdoc", "gsheet", "gslide"). Empty = all.
         tag: Filter by tag. Empty = all.
         limit: Max results (default 20).
         offset: Pagination offset.
