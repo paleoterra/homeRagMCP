@@ -9,10 +9,8 @@ Required extras: uv sync --extra google
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Union
 
 
@@ -94,8 +92,8 @@ def _extract_google_id(url_or_id: str) -> str:
         if m:
             return m.group(1)
 
-    # Bare ID: no slash, no ://
-    if "/" not in url_or_id and "://" not in url_or_id:
+    # Bare ID: valid Google ID characters (alphanumeric, hyphen, underscore)
+    if re.fullmatch(r"[A-Za-z0-9_\-]+", url_or_id):
         return url_or_id
 
     raise ValueError(f"Could not extract Google Drive file ID from: {url_or_id}")
