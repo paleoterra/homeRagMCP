@@ -372,3 +372,212 @@ async def ingest_chat(
         doc_ids.append(doc_id)
 
     return doc_ids
+
+
+async def ingest_google_item(
+    db: Database,
+    embedder: Embedder,
+    file_id_or_url: str,
+    tags: list[str] | None = None,
+    force: bool = False,
+) -> str:
+    """Ingest a single Google Drive item (Doc, Sheet, Slide, or binary file).
+
+    Accepts a full Google URL or a bare file ID (or gdrive://ID).
+    Returns the document UUID.
+    """
+    from brain.ingestion.parsers.google_drive import (
+        _extract_google_id,
+        BinaryDriveFile,
+        GoogleDriveClient,
+        GoogleParsedDocument,
+    )
+
+    file_id = _extract_google_id(file_id_or_url)
+    client = GoogleDriveClient()
+    result = client.fetch_item(file_id)
+    source_ref = f"gdrive://{file_id}"
+
+    if isinstance(result, GoogleParsedDocument):
+        return await _store(
+            db, embedder,
+            result.title, result.content,
+            source_type=result.source_type,
+            source_ref=source_ref,
+            author=result.author,
+            metadata=result.metadata,
+            tags=tags,
+            pre_chunks=result.pre_chunks,
+            force=force,
+        )
+
+    # BinaryDriveFile — download to temp and parse with existing parsers
+    assert isinstance(result, BinaryDriveFile)
+    return await _ingest_binary_drive_file(
+        db, embedder, client, result, source_ref, tags=tags, force=force
+    )
+
+
+async def _ingest_binary_drive_file(
+    db: Database,
+    embedder: Embedder,
+    client,
+    binary: "BinaryDriveFile",
+    source_ref: str,
+    tags: list[str] | None = None,
+    force: bool = False,
+) -> str:
+    """Download a binary Drive file to a temp path, parse it, and store with gdrive source_ref."""
+    import io
+    import tempfile
+    from pathlib import Path as _Path
+
+    from googleapiclient.http import MediaIoBaseDownload
+
+    request = client._drive.files().get_media(fileId=binary.file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, request)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    buf.seek(0)
+
+    suffix = _Path(binary.name).suffix.lower() or ".bin"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(buf.read())
+        tmp_path = tmp.name
+
+    try:
+        title, content, src_type, pre_chunks, author, meta = _parse_file_for_storage(tmp_path, binary.name)
+    finally:
+        import os
+        os.unlink(tmp_path)
+
+    return await _store(
+        db, embedder,
+        title, content,
+        source_type=src_type,
+        source_ref=source_ref,
+        author=author,
+        metadata=meta,
+        tags=tags,
+        pre_chunks=pre_chunks,
+        force=force,
+    )
+
+
+def _parse_file_for_storage(tmp_path: str, original_name: str):
+    """Parse a file and return (title, content, source_type, pre_chunks, author, metadata).
+
+    This mirrors the dispatch logic in ingest_file but returns parsed data
+    rather than calling _store(), so the caller can provide a custom source_ref.
+    """
+    from pathlib import Path as _Path
+    suffix = _Path(original_name).suffix.lower()
+
+    if suffix == ".pdf":
+        from brain.ingestion.parsers.pdf import parse_pdf
+        from brain.ingestion.chunker import chunk_text
+        parsed = parse_pdf(tmp_path)
+        pre_chunks = [
+            {"content": chunk, "page_number": page_num}
+            for page_num, page_text in parsed.pages
+            for chunk in chunk_text(page_text)
+            if chunk.strip()
+        ]
+        return parsed.title, parsed.content, "pdf", pre_chunks, parsed.author, parsed.metadata
+
+    elif suffix in {".md", ".markdown"}:
+        from brain.ingestion.parsers.markdown import chunk_markdown_sections, parse_markdown
+        parsed = parse_markdown(tmp_path)
+        pre_chunks = chunk_markdown_sections(parsed.content)
+        return parsed.title, parsed.content, "md", pre_chunks, parsed.author, parsed.metadata
+
+    elif suffix in {".docx", ".doc"}:
+        from brain.ingestion.parsers.document import parse_docx
+        parsed = parse_docx(tmp_path)
+        return parsed.title, parsed.content, "doc", parsed.pre_chunks, parsed.author, parsed.metadata
+
+    elif suffix == ".pptx":
+        from brain.ingestion.parsers.document import parse_pptx
+        parsed = parse_pptx(tmp_path)
+        return parsed.title, parsed.content, "pptx", parsed.pre_chunks, parsed.author, parsed.metadata
+
+    elif suffix == ".xlsx":
+        from brain.ingestion.parsers.document import parse_excel
+        parsed = parse_excel(tmp_path)
+        return parsed.title, parsed.content, "xlsx", parsed.pre_chunks, parsed.author, parsed.metadata
+
+    elif suffix in {".txt", ".rst"}:
+        from brain.ingestion.parsers.document import parse_text
+        parsed = parse_text(tmp_path)
+        return parsed.title, parsed.content, "txt", None, parsed.author, parsed.metadata
+
+    else:
+        # Unknown binary type — ingest as raw text best-effort
+        try:
+            content = open(tmp_path, encoding="utf-8", errors="replace").read()
+        except Exception:
+            content = ""
+        return _Path(original_name).stem, content, "txt", None, None, None
+
+
+async def ingest_google_folder(
+    db: Database,
+    embedder: Embedder,
+    folder_id_or_url: str,
+    tags: list[str] | None = None,
+    force: bool = False,
+) -> dict:
+    """Recursively ingest all files in a Google Drive folder.
+
+    Returns {"ingested": int, "skipped": int, "failed": int, "skip_reasons": dict}.
+    """
+    import logging
+
+    from brain.ingestion.parsers.google_drive import (
+        _extract_google_id,
+        GoogleDriveClient,
+        UnsupportedGoogleTypeError,
+    )
+
+    log = logging.getLogger(__name__)
+    folder_id = _extract_google_id(folder_id_or_url)
+    client = GoogleDriveClient()
+    # fetch_folder raises ValueError for Shared Drives — this is OUTSIDE the per-file
+    # try/except below, so Shared Drive errors propagate immediately (not caught/counted).
+    file_ids = client.fetch_folder(folder_id)
+
+    ingested = 0
+    skipped = 0
+    failed = 0
+    skip_reasons: dict[str, int] = {}
+
+    def _bump(reason: str) -> None:
+        skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+
+    for file_id in file_ids:
+        try:
+            await ingest_google_item(db, embedder, file_id, tags=tags, force=force)
+            ingested += 1
+        except ValueError as e:
+            if "Already indexed" in str(e) or "force=True" in str(e):
+                skipped += 1
+                _bump("duplicate")
+            else:
+                # Other ValueErrors (bad URL format, etc.) — treat as failure
+                failed += 1
+                log.warning("Failed to ingest Drive file %s: %s", file_id, e)
+        except UnsupportedGoogleTypeError:
+            skipped += 1
+            _bump("unsupported_type")
+        except Exception as e:
+            failed += 1
+            log.warning("Failed to ingest Drive file %s: %s", file_id, e)
+
+    return {
+        "ingested": ingested,
+        "skipped": skipped,
+        "failed": failed,
+        "skip_reasons": skip_reasons,
+    }

@@ -1,6 +1,7 @@
 """Tests for Google Drive parser — URL parsing and data types."""
+import asyncio
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from brain.ingestion.parsers.google_drive import (
@@ -11,6 +12,78 @@ from brain.ingestion.parsers.google_drive import (
     GoogleParsedDocument,
     BinaryDriveFile,
 )
+from brain.ingestion.pipeline import ingest_google_item, ingest_google_folder
+
+
+def _async(coro):
+    return asyncio.run(coro)
+
+
+def _make_db_embedder():
+    db = MagicMock()
+    db.find_by_source_ref = AsyncMock(return_value=None)
+    db.add_document = AsyncMock(return_value="doc-uuid-1")
+    db.add_chunks = AsyncMock()
+    db.add_tags = AsyncMock()
+    embedder = MagicMock()
+    embedder.embed = AsyncMock(return_value=[0.1] * 768)
+    return db, embedder
+
+
+def test_ingest_google_item_gdoc():
+    """ingest_google_item stores a GoogleParsedDocument and returns a UUID."""
+    db, embedder = _make_db_embedder()
+    parsed = GoogleParsedDocument(
+        title="Test Doc",
+        content="Hello world",
+        source_type="gdoc",
+        file_id="DOCID",
+        author="Alice",
+        metadata={"modified_time": "2026-01-01T00:00:00Z"},
+    )
+    mock_client = MagicMock()
+    mock_client.fetch_item.return_value = parsed
+
+    with patch(
+        # Patch at the source module — ingest_google_item uses a local import
+        # so patching pipeline.GoogleDriveClient would be silently ignored
+        "brain.ingestion.parsers.google_drive.GoogleDriveClient",
+        return_value=mock_client,
+    ):
+        doc_id = _async(ingest_google_item(db, embedder, "gdrive://DOCID"))
+
+    assert doc_id == "doc-uuid-1"
+    db.add_document.assert_called_once()
+    call_kwargs = db.add_document.call_args.kwargs
+    assert call_kwargs["source_ref"] == "gdrive://DOCID"
+    assert call_kwargs["source_type"] == "gdoc"
+
+
+def test_ingest_google_folder_counts():
+    """ingest_google_folder returns correct ingested/skipped/failed counts."""
+    db, embedder = _make_db_embedder()
+
+    mock_client = MagicMock()
+    mock_client.fetch_folder.return_value = ["FILE1", "FILE2", "FILE3"]
+    mock_client.fetch_item.side_effect = [
+        GoogleParsedDocument(
+            title="Doc1", content="a", source_type="gdoc", file_id="FILE1",
+            metadata={},
+        ),
+        UnsupportedGoogleTypeError("application/vnd.google-apps.form"),
+        GoogleParsedDocument(
+            title="Doc3", content="c", source_type="gdoc", file_id="FILE3",
+            metadata={},
+        ),
+    ]
+
+    with patch("brain.ingestion.parsers.google_drive.GoogleDriveClient", return_value=mock_client):
+        result = _async(ingest_google_folder(db, embedder, "gdrive://FOLDERID"))
+
+    assert result["ingested"] == 2
+    assert result["skipped"] == 1
+    assert result["skip_reasons"]["unsupported_type"] == 1
+    assert result["failed"] == 0
 
 
 def _make_client():
