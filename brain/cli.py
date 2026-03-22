@@ -431,5 +431,78 @@ def ingest(
     asyncio.run(_run())
 
 
+@app.command(name="google-auth")
+def google_auth(
+    secrets: Path = typer.Option(
+        None,
+        "--secrets",
+        help="Path to client_secrets.json (overrides GOOGLE_CLIENT_SECRETS env var)",
+    ),
+    token_path: Path = typer.Option(
+        None,
+        "--token-path",
+        help="Where to save the token (overrides GOOGLE_TOKEN_PATH env var)",
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Re-authenticate even if a valid token already exists"
+    ),
+) -> None:
+    """Authenticate with Google (OAuth2) for Drive/Docs/Sheets/Slides access.
+
+    Opens a browser to complete the OAuth2 consent flow, then saves a token
+    for future use. Desktop environments only — use a service account for
+    headless/SSH contexts.
+
+    Requires: uv sync --extra google
+    """
+    import json
+    import os
+
+    try:
+        from google_auth_oauthlib.flow import InstalledAppFlow
+        from google.oauth2.credentials import Credentials
+    except ImportError:
+        typer.echo("Error: Google extras not installed. Run: uv sync --extra google")
+        raise typer.Exit(1)
+
+    from brain.ingestion.parsers.google_drive import SCOPES, _DEFAULT_SECRETS, _DEFAULT_TOKEN
+
+    secrets_path = secrets or Path(os.environ.get("GOOGLE_CLIENT_SECRETS", str(_DEFAULT_SECRETS)))
+    tok_path = token_path or Path(os.environ.get("GOOGLE_TOKEN_PATH", str(_DEFAULT_TOKEN)))
+
+    # Check if already authenticated
+    if not force and tok_path.exists():
+        try:
+            data = json.loads(tok_path.read_text())
+            creds = Credentials.from_authorized_user_info(data, SCOPES)
+            if creds.valid:
+                typer.echo(f"Already authenticated. Use --force to re-authenticate.")
+                typer.echo(f"Token: {tok_path}")
+                return
+        except Exception:
+            pass  # Token invalid or corrupt — proceed to re-auth
+
+    # Check client secrets exist
+    if not secrets_path.exists():
+        typer.echo(f"Error: client_secrets.json not found at {secrets_path}")
+        typer.echo(
+            "Download it from Google Cloud Console → APIs & Services → "
+            "Credentials → OAuth 2.0 Client ID → Download JSON"
+        )
+        raise typer.Exit(1)
+
+    typer.echo("Opening browser for Google OAuth2 consent…")
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(str(secrets_path), SCOPES)
+        creds = flow.run_local_server(port=0)
+    except Exception as e:
+        typer.echo(f"Authentication failed: {e}")
+        raise typer.Exit(1)
+
+    tok_path.parent.mkdir(parents=True, exist_ok=True)
+    tok_path.write_text(creds.to_json())
+    typer.echo(f"Authenticated successfully. Token saved to {tok_path}")
+
+
 if __name__ == "__main__":
     app()
