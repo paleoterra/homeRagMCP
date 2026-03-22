@@ -9,8 +9,10 @@ Required extras: uv sync --extra google
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Union
 
 
@@ -97,3 +99,72 @@ def _extract_google_id(url_or_id: str) -> str:
         return url_or_id
 
     raise ValueError(f"Could not extract Google Drive file ID from: {url_or_id}")
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/presentations.readonly",
+]
+
+_DEFAULT_SECRETS = Path.home() / ".config" / "brain" / "client_secrets.json"
+_DEFAULT_TOKEN = Path.home() / ".config" / "brain" / "google_token.json"
+
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+
+class GoogleAuth:
+    """Resolves Google credentials from service account or OAuth2 token."""
+
+    def get_credentials(self):
+        """Return valid Google credentials, refreshing if needed.
+
+        Resolution order:
+        1. GOOGLE_SERVICE_ACCOUNT_KEY env var
+        2. OAuth2 token file at GOOGLE_TOKEN_PATH
+        3. RuntimeError with setup instructions
+        """
+        sa_key = os.environ.get("GOOGLE_SERVICE_ACCOUNT_KEY")
+        if sa_key:
+            return self._service_account_creds(sa_key)
+
+        token_path = Path(os.environ.get("GOOGLE_TOKEN_PATH", str(_DEFAULT_TOKEN)))
+        if token_path.exists():
+            return self._oauth2_creds(token_path)
+
+        raise RuntimeError(
+            "Google credentials not configured.\n"
+            "  Desktop:  brain google-auth\n"
+            "  Headless: set GOOGLE_SERVICE_ACCOUNT_KEY=/path/to/key.json"
+        )
+
+    def _service_account_creds(self, key_path: str):
+        from google.oauth2.service_account import Credentials
+        return Credentials.from_service_account_file(key_path, scopes=SCOPES)
+
+    def _oauth2_creds(self, token_path: Path):
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        import json
+
+        data = json.loads(token_path.read_text())
+        creds = Credentials.from_authorized_user_info(data, SCOPES)
+
+        if creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                token_path.write_text(creds.to_json())
+            except Exception as e:
+                raise RuntimeError(
+                    f"OAuth2 token refresh failed: {e}\n"
+                    "Re-run: brain google-auth"
+                ) from e
+
+        return creds

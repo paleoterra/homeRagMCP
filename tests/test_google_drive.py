@@ -1,6 +1,9 @@
 """Tests for Google Drive parser — URL parsing and data types."""
+import json
+from unittest.mock import MagicMock, patch
+
 import pytest
-from brain.ingestion.parsers.google_drive import _extract_google_id, UnsupportedGoogleTypeError
+from brain.ingestion.parsers.google_drive import _extract_google_id, UnsupportedGoogleTypeError, GoogleAuth
 
 
 def test_extract_docs_url():
@@ -51,3 +54,37 @@ def test_extract_unrecognized_raises():
 def test_unsupported_google_type_error():
     err = UnsupportedGoogleTypeError("application/vnd.google-apps.form")
     assert "application/vnd.google-apps.form" in str(err)
+
+
+def test_google_auth_no_credentials_raises(tmp_path, monkeypatch):
+    """No env vars and no token file → RuntimeError with instructions."""
+    monkeypatch.delenv("GOOGLE_SERVICE_ACCOUNT_KEY", raising=False)
+    monkeypatch.setenv("GOOGLE_TOKEN_PATH", str(tmp_path / "nonexistent.json"))
+    auth = GoogleAuth()
+    with pytest.raises(RuntimeError, match="brain google-auth"):
+        auth.get_credentials()
+
+
+def test_google_auth_service_account(tmp_path, monkeypatch):
+    """Service account key path is set → builds service account credentials."""
+    key_file = tmp_path / "key.json"
+    key_file.write_text(json.dumps({
+        "type": "service_account",
+        "project_id": "test",
+        "private_key_id": "key1",
+        "private_key": "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA-----END RSA PRIVATE KEY-----\n",
+        "client_email": "test@test.iam.gserviceaccount.com",
+        "client_id": "123",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+    }))
+    monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_KEY", str(key_file))
+
+    fake_creds = MagicMock()
+    with patch(
+        "google.oauth2.service_account.Credentials.from_service_account_file",
+        return_value=fake_creds,
+    ):
+        auth = GoogleAuth()
+        creds = auth.get_credentials()
+    assert creds is fake_creds
