@@ -433,6 +433,29 @@ def test_fetch_folder_returns_flat_file_ids():
     assert sorted(result) == ["FILE1", "FILE2", "FILE3"]
 
 
+def test_ingest_google_item_binary():
+    """ingest_google_item downloads and stores a binary Drive file with gdrive:// source_ref."""
+    import tempfile, os
+    db, embedder = _make_db_embedder()
+    binary = BinaryDriveFile(file_id="PDFID", name="report.pdf", mime_type="application/pdf")
+    mock_client = MagicMock()
+    mock_client.fetch_item.return_value = binary
+    mock_client.download_file.return_value = b"%PDF-1.4 fake content"
+
+    # Write a real temp PDF that _parse_file_for_storage can "parse"
+    # (pdf parser may fail on fake content — patch it instead)
+    with patch("brain.ingestion.parsers.google_drive.GoogleDriveClient", return_value=mock_client), \
+         patch("brain.ingestion.pipeline._parse_file_for_storage",
+               return_value=("Report", "content", "pdf", None, None, {})):
+        doc_id = _async(ingest_google_item(db, embedder, "gdrive://PDFID"))
+
+    assert doc_id == "doc-uuid-1"
+    call_kwargs = db.add_document.call_args.kwargs
+    assert call_kwargs["source_ref"] == "gdrive://PDFID"
+    assert call_kwargs["source_type"] == "pdf"
+    mock_client.download_file.assert_called_once_with("PDFID")
+
+
 def test_fetch_folder_shared_drive_raises():
     """fetch_folder raises ValueError for Shared Drive folders."""
     client = _make_client()

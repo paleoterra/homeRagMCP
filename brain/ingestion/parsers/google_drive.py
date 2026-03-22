@@ -416,6 +416,20 @@ class GoogleDriveClient:
 
         return file_ids
 
+    def download_file(self, file_id: str) -> bytes:
+        """Download a binary Drive file and return its contents as bytes."""
+        import io
+        from googleapiclient.http import MediaIoBaseDownload
+
+        request = self._drive.files().get_media(fileId=file_id)
+        buf = io.BytesIO()
+        downloader = MediaIoBaseDownload(buf, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        buf.seek(0)
+        return buf.read()
+
     def _extract_slide_notes(self, slide: dict) -> list[str]:
         """Extract speaker notes from a slide."""
         notes = []

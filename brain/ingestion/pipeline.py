@@ -412,7 +412,8 @@ async def ingest_google_item(
         )
 
     # BinaryDriveFile — download to temp and parse with existing parsers
-    assert isinstance(result, BinaryDriveFile)
+    if not isinstance(result, BinaryDriveFile):
+        raise TypeError(f"Unexpected fetch_item result type: {type(result)}")
     return await _ingest_binary_drive_file(
         db, embedder, client, result, source_ref, tags=tags, force=force
     )
@@ -428,23 +429,14 @@ async def _ingest_binary_drive_file(
     force: bool = False,
 ) -> str:
     """Download a binary Drive file to a temp path, parse it, and store with gdrive source_ref."""
-    import io
     import tempfile
     from pathlib import Path as _Path
 
-    from googleapiclient.http import MediaIoBaseDownload
-
-    request = client._drive.files().get_media(fileId=binary.file_id)
-    buf = io.BytesIO()
-    downloader = MediaIoBaseDownload(buf, request)
-    done = False
-    while not done:
-        _, done = downloader.next_chunk()
-    buf.seek(0)
+    data = client.download_file(binary.file_id)
 
     suffix = _Path(binary.name).suffix.lower() or ".bin"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(buf.read())
+        tmp.write(data)
         tmp_path = tmp.name
 
     try:
@@ -507,6 +499,16 @@ def _parse_file_for_storage(tmp_path: str, original_name: str):
         from brain.ingestion.parsers.document import parse_excel
         parsed = parse_excel(tmp_path)
         return parsed.title, parsed.content, "xlsx", parsed.pre_chunks, parsed.author, parsed.metadata
+
+    elif suffix == ".numbers":
+        from brain.ingestion.parsers.document import parse_numbers
+        parsed = parse_numbers(tmp_path)
+        return parsed.title, parsed.content, "numbers", parsed.pre_chunks, parsed.author, parsed.metadata
+
+    elif suffix == ".epub":
+        from brain.ingestion.parsers.document import parse_epub
+        parsed = parse_epub(tmp_path)
+        return parsed.title, parsed.content, "epub", parsed.pre_chunks, parsed.author, parsed.metadata
 
     elif suffix in {".txt", ".rst"}:
         from brain.ingestion.parsers.document import parse_text
